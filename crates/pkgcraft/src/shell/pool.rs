@@ -1,13 +1,15 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::OnceLock;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::ipc::{self, IpcSender};
 use itertools::Itertools;
-use nix::unistd::{ForkResult, Pid, dup, dup2, fork};
-use scallop::pool::{NamedSemaphore, redirect_output, suppress_output};
+use nix::unistd::{ForkResult, dup, dup2, fork};
+use scallop::pool::{NamedSemaphore, redirect_output};
 use scallop::variables::{self, ShellVariable};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -102,7 +104,7 @@ impl MetadataTask {
 /// Task builder for ebuild package metadata cache generation.
 #[derive(Debug)]
 pub struct MetadataTaskBuilder {
-    tx: IpcSender<Command>,
+    tx: Sender<Command>,
     repo: EbuildRepo,
     cache: Option<MetadataCache>,
     force: bool,
@@ -292,9 +294,9 @@ enum Command {
 #[derive(Debug)]
 pub struct BuildPool {
     jobs: usize,
-    tx: IpcSender<Command>,
-    rx: IpcReceiver<Command>,
-    pid: OnceLock<Pid>,
+    tx: Sender<Command>,
+    rx: Receiver<Command>,
+    th: OnceLock<JoinHandle<crate::Result<()>>>,
 }
 
 // needed due to IpcSender lacking Sync
@@ -308,68 +310,65 @@ impl Default for BuildPool {
 
 impl BuildPool {
     pub(crate) fn new(jobs: usize) -> Self {
-        let (tx, rx) = ipc::channel().unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             jobs,
             tx,
             rx,
-            pid: OnceLock::new(),
+            th: OnceLock::new(),
         }
     }
 
     /// Start the build pool loop.
     pub(crate) fn start(&self, config: ConfigRepos) -> crate::Result<()> {
-        if self.pid.get().is_some() {
+        if self.th.get().is_some() {
             // task pool already running
             return Ok(());
         }
 
         // initialize bash
         super::init()?;
+        // initialize semaphore to track jobs
+        let pid = std::process::id();
+        let name = format!("/pkgcraft-task-pool-{pid}");
+        let rx = self.rx.clone();
+        let jobs = self.jobs;
 
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child }) => {
-                self.pid.set(child).expect("task pool already running");
-                Ok(())
+        let th = std::thread::spawn(move || {
+            let mut sem = NamedSemaphore::new(&name, jobs)?;
+            // signal child to exit on parent death
+            #[cfg(target_os = "linux")]
+            {
+                use nix::sys::{prctl, signal::Signal};
+                prctl::set_pdeathsig(Signal::SIGTERM).unwrap();
             }
-            Ok(ForkResult::Child) => {
-                // signal child to exit on parent death
-                #[cfg(target_os = "linux")]
-                {
-                    use nix::sys::{prctl, signal::Signal};
-                    prctl::set_pdeathsig(Signal::SIGTERM).unwrap();
-                }
 
-                // initialize semaphore to track jobs
-                let pid = std::process::id();
-                let name = format!("/pkgcraft-task-pool-{pid}");
-                let mut sem = NamedSemaphore::new(&name, self.jobs)?;
+            let f = std::fs::File::options().write(true).open("/dev/null")?;
 
-                // enable internal bash SIGCHLD handler
-                unsafe { scallop::bash::set_sigchld_handler() };
+            while let Ok(Command::Task(task)) = rx.recv() {
+                // wait on bounded semaphore for pool space
+                sem.acquire().unwrap();
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { .. }) => (),
+                    Ok(ForkResult::Child) => {
+                        redirect_output(&f).unwrap();
+                        // enable internal bash SIGCHLD handler
+                        unsafe { scallop::bash::set_sigchld_handler() };
 
-                // suppress global output by default
-                suppress_output()?;
-
-                while let Ok(Command::Task(task)) = self.rx.recv() {
-                    // wait on bounded semaphore for pool space
-                    sem.acquire().unwrap();
-                    match unsafe { fork() } {
-                        Ok(ForkResult::Parent { .. }) => (),
-                        Ok(ForkResult::Child) => {
-                            scallop::shell::fork_init();
-                            task.run(&config);
-                            sem.release().unwrap();
-                            unsafe { libc::_exit(0) };
-                        }
-                        Err(e) => panic!("process pool fork failed: {e}"), // grcov-excl-line
+                        scallop::shell::fork_init();
+                        task.run(&config);
+                        sem.release().unwrap();
+                        unsafe { libc::_exit(0) };
                     }
+                    Err(e) => panic!("process pool fork failed: {e}"), // grcov-excl-line
                 }
-
-                unsafe { libc::_exit(0) }
             }
-            Err(e) => panic!("process pool failed start: {e}"), // grcov-excl-line
-        }
+            Ok(())
+        });
+
+        self.th.set(th).expect("task pool already running");
+
+        Ok(())
     }
 
     /// Create an ebuild package metadata regeneration task builder.
